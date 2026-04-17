@@ -1,5 +1,20 @@
 # Building PES-VCS — A Version Control System from Scratch
 
+## Submission Metadata
+
+- SRN: `PES2UG24CS579`
+- Repository: `PES2UG24CS579-pes-vcs`
+- Report file: `report.pdf` (contains required screenshots and Q5/Q6 answers)
+
+## Commit Requirement Checklist
+
+- Phase 1: at least 5 commits
+- Phase 2: at least 5 commits
+- Phase 3: at least 5 commits
+- Phase 4: at least 5 commits
+
+Minimum required total across implementation phases: **20 commits**.
+
 **Objective:** Build a local version control system that tracks file changes, stores snapshots efficiently, and supports commit history. Every component maps directly to operating system and filesystem concepts.
 
 **Platform:** Ubuntu 22.04
