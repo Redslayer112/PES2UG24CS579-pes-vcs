@@ -546,15 +546,111 @@ The following questions cover filesystem concepts beyond the implementation scop
 
 **Q5.1:** A branch in Git is just a file in `.git/refs/heads/` containing a commit hash. Creating a branch is creating a file. Given this, how would you implement `pes checkout <branch>` — what files need to change in `.pes/`, and what must happen to the working directory? What makes this operation complex?
 
+**Answer:**
+To implement `pes checkout <branch>`, two things must change in `.pes/`:
+1. **`HEAD`** must be rewritten to `ref: refs/heads/<branch>`.
+2. The **working directory** must be updated to match the tree referenced by the target branch's latest commit.
+
+The procedure is:
+1. Resolve the target branch ref (`.pes/refs/heads/<branch>`) to its commit hash. If the branch does not exist, create the ref file pointing to the current HEAD commit (new branch).
+2. Read the target commit object and extract its root tree hash.
+3. Walk the current HEAD's tree and the target tree simultaneously. For each path that differs: if the target has a file the current doesn't, write it out; if the current has a file the target doesn't, delete it; if both have the file but different blobs, overwrite it.
+4. Rebuild the index to match the target tree's entries.
+5. Rewrite `HEAD` to `ref: refs/heads/<branch>`.
+
+**Complexity sources:**
+- **Dirty-file detection:** Before touching anything, every file tracked in the current index must be compared against both the working directory (for uncommitted changes) and the target tree (for cross-branch differences). A file that is dirty *and* different between branches blocks the checkout.
+- **Partial-failure atomicity:** The operation modifies the working directory, index, and HEAD. A crash midway leaves the repo in an inconsistent state. Git stages the update in memory and does all filesystem writes before touching HEAD.
+- **Nested directory cleanup:** Deleting files that only exist on the current branch may leave empty directories that must be removed.
+- **Untracked-file collisions:** Untracked files whose names clash with files being checked out must be detected and reported without overwriting the user's data.
+
+---
+
 **Q5.2:** When switching branches, the working directory must be updated to match the target branch's tree. If the user has uncommitted changes to a tracked file, and that file differs between branches, checkout must refuse. Describe how you would detect this "dirty working directory" conflict using only the index and the object store.
 
+**Answer:**
+The detection uses a three-way comparison for every path tracked in the index:
+
+1. **Is the working file dirty?** For each index entry, `stat()` the working-directory file and compare its `mtime` and `size` to the values stored in the index entry. A mismatch means the file may have changed. To be precise, re-hash the file content and compare it to the blob hash in the index entry. If they differ, the file is dirty (has uncommitted local changes).
+
+2. **Does the target branch differ for this path?** Walk the target branch's root tree (read the target commit object, then recursively read tree objects) and look up the blob hash for the same path. If the target branch's blob hash differs from the index entry's blob hash, the two branches have different content for this file.
+
+3. **Conflict:** If *both* conditions are true for the same path — the working file is dirty AND the target branch has a different version — the checkout must refuse and print an error for that path. The user must commit or stash the change first.
+
+Files that are dirty but identical across branches (same blob hash) can be carried over safely without refusing.
+
+For efficiency, the mtime/size fast-path avoids re-hashing every file; only files with changed metadata need a full content hash comparison.
+
+---
+
 **Q5.3:** "Detached HEAD" means HEAD contains a commit hash directly instead of a branch reference. What happens if you make commits in this state? How could a user recover those commits?
+
+**Answer:**
+In detached HEAD state, `HEAD` holds a raw commit hash (e.g., `a1b2c3...`) rather than `ref: refs/heads/main`. When you run `pes commit`, the `head_update` function sees no branch reference, so it overwrites `HEAD` directly with the new commit hash. The new commit is written to the object store and `HEAD` advances, but **no branch ref file is updated**. You get a chain of commits anchored to nothing but `HEAD`.
+
+The moment you switch to another branch (or do anything that moves HEAD), these commits become **unreachable** — no branch, tag, or other ref points to them. They are not immediately deleted (garbage collection hasn't run), but they are invisible to `pes log` and any branch-based traversal.
+
+**Recovery options:**
+1. **If you know the commit hash** (e.g., from terminal scroll-back or a note): `echo <hash> > .pes/refs/heads/recovery-branch` and then update `HEAD` to `ref: refs/heads/recovery-branch`. This makes a new branch that points at the detached chain.
+2. **If you don't know the hash**: Scan all object files under `.pes/objects/`, read each commit object, and find those whose hashes are not reachable from any branch ref. The most recent such commit is likely the tip of the detached work. Create a branch pointing to it.
+3. **Git equivalent**: Git maintains a `reflog` (a log of every position HEAD has held) which makes recovery trivial. PES-VCS has no reflog, so the only fallback is scanning the object store before GC runs.
+
+---
 
 ### Garbage Collection and Space Reclamation
 
 **Q6.1:** Over time, the object store accumulates unreachable objects — blobs, trees, or commits that no branch points to (directly or transitively). Describe an algorithm to find and delete these objects. What data structure would you use to track "reachable" hashes efficiently? For a repository with 100,000 commits and 50 branches, estimate how many objects you'd need to visit.
 
+**Answer:**
+**Algorithm (mark-and-sweep):**
+
+*Mark phase — find all reachable objects:*
+1. Start from every ref: read all files under `.pes/refs/heads/` (and any other ref namespaces, e.g., tags). Each gives a commit hash — add each to a **work queue**.
+2. Also add the hash in `HEAD` if it is a direct commit hash (detached HEAD).
+3. Process the work queue:
+   - Dequeue a hash. If already in the **reachable set**, skip (cycle/diamond avoidance).
+   - Add the hash to the reachable set.
+   - Read the object. If it is a **commit**, enqueue its `tree` hash and its `parent` hash (if any).
+   - If it is a **tree**, parse it and enqueue every entry's hash (blob or nested tree).
+   - Blobs have no children; just mark them.
+4. Repeat until the queue is empty.
+
+*Sweep phase — delete unreachable objects:*
+5. Walk every file under `.pes/objects/` using `find` or `opendir`/`readdir`. Reconstruct each file's hash from its path (shard dir + filename).
+6. If the hash is **not** in the reachable set, delete the file with `unlink()`. After processing each shard directory, attempt `rmdir()` on it (succeeds only if now empty).
+
+**Data structure:** A **hash set** (e.g., open-addressing hash table or a sorted array of `ObjectID` with binary search) keyed on the 32-byte SHA-256 hash. Lookup must be O(1) average (hash table) or O(log n) (sorted array). Memory usage: each entry is 32 bytes, so 1 million entries ≈ 32 MB — acceptable.
+
+**Estimate for 100,000 commits / 50 branches:**
+- Each commit references 1 tree and at most 1 parent commit. A realistic project tree might contain ~10–50 tree objects and ~20–100 blob objects per commit (assuming most blobs are shared across commits).
+- Conservative estimate: ~30 unique objects per commit level × 100,000 commits = **~3,000,000 object visits** in the worst case (all unique). In practice, deduplication means most blobs are shared and the reachable set is far smaller — likely **200,000–500,000 unique objects** for an active codebase.
+
+---
+
 **Q6.2:** Why is it dangerous to run garbage collection concurrently with a commit operation? Describe a race condition where GC could delete an object that a concurrent commit is about to reference. How does Git's real GC avoid this?
+
+**Answer:**
+**The race condition:**
+
+Consider the following interleaving of a `pes commit` and a concurrent `pes gc`:
+
+1. `commit`: calls `object_write(OBJ_BLOB, ...)` for a file — writes blob `B` to `.pes/objects/ab/1234...`.
+2. `gc` (mark phase): scans all refs and walks reachable objects. At this instant, blob `B` exists on disk but **is not yet referenced by any commit, tree, or index entry visible to GC** (the commit hasn't been written yet). GC marks `B` as unreachable.
+3. `commit`: calls `tree_from_index`, which writes tree `T` referencing `B`; then writes commit `C` referencing `T`; then updates the branch ref.
+4. `gc` (sweep phase): deletes all objects not in the reachable set — including `B`.
+5. The repository now has commit `C` → tree `T` → blob `B`, but blob `B` has been deleted. The repository is **corrupt**.
+
+**How Git avoids this:**
+
+1. **Grace period / "recent objects" heuristic:** Git's `git gc` skips deletion of any object whose on-disk modification time is less than a configurable threshold (default: 2 weeks for loose objects, via `gc.pruneExpire`). A freshly written blob will not be collected even if no ref points to it yet, because the commit writing that blob hasn't finished. This is simple and effective for the vast majority of cases.
+
+2. **Lockfiles:** Git uses lock files (`.lock` suffix) for ref updates. GC checks for in-progress operations by looking for lock files and will not delete objects if it detects an ongoing write.
+
+3. **Keeping pack files separate from loose objects:** During `git gc`, newly compacted pack files are written atomically before old loose objects are deleted. Commit operations write loose objects; GC packs them. The two operations touch disjoint sets of files most of the time.
+
+4. **`--keep-pack` and pack locking:** When `git repack` runs, it writes a `.keep` file alongside a pack file to prevent `git prune-packed` from deleting its contents before the index is updated.
+
+The combination of the grace-period heuristic and lockfile checking means GC is safe in practice even without a global lock, because the window in which a new object is unreachable but needed is bounded by the commit operation's duration — well under the 2-week grace period.
 
 ---
 
