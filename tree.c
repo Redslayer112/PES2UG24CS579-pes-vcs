@@ -218,7 +218,8 @@ static int write_tree_level(const Index *index, const char *prefix, ObjectID *id
         if (tree.count >= MAX_TREE_ENTRIES) return -1;
 
         char child_prefix[1024];
-        snprintf(child_prefix, sizeof(child_prefix), "%s%s/", prefix, subdirs[i]);
+        int n = snprintf(child_prefix, sizeof(child_prefix), "%s%s/", prefix, subdirs[i]);
+        if (n < 0 || (size_t)n >= sizeof(child_prefix)) return -1;
 
         ObjectID child_id;
         if (write_tree_level(index, child_prefix, &child_id) != 0) return -1;
@@ -226,7 +227,7 @@ static int write_tree_level(const Index *index, const char *prefix, ObjectID *id
         TreeEntry *e = &tree.entries[tree.count++];
         e->mode = MODE_DIR;
         e->hash = child_id;
-        snprintf(e->name, sizeof(e->name), "%s", subdirs[i]);
+        if (snprintf(e->name, sizeof(e->name), "%s", subdirs[i]) >= (int)sizeof(e->name)) return -1;
     }
 
     void *raw = NULL;
